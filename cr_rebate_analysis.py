@@ -6,9 +6,14 @@ from datetime import date
 
 INPUT_CR = "v2.Conversion Rate.xlsx"
 INPUT_VC = "v2.2026 VC Master Data.xlsx"
+INPUT_RP = "v2.Retail Prices.xlsx"
 OUTPUT   = "CR_Increase_No_Rebate_Analysis.xlsx"
 
-MONTHS = ["Jan 2026", "Feb 2026", "Mar 2026", "Apr 2026", "May 2026"]
+MONTHS = [
+    "Jan 2026", "Feb 2026", "Mar 2026", "Apr 2026", "May 2026",
+    "Jun 2026", "Jul 2026", "Aug 2026", "Sep 2026", "Oct 2026",
+    "Nov 2026", "Dec 2026",
+]
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 NAVY       = "1F3864"
@@ -17,12 +22,10 @@ LT_BLUE    = "D6E4F0"
 WHITE      = "FFFFFF"
 GRAY       = "F2F2F2"
 DARK       = "1F1F1F"
-GREEN_BG   = "E2EFDA"
-GREEN_FG   = "375623"
 GREEN_TAB  = "538135"
-ORANGE_BG  = "FCE4D6"
-ORANGE_FG  = "843C0C"
 ORANGE_TAB = "C55A11"
+RED_TAB    = "C00000"
+LIME_TAB   = "70AD47"
 BORDER_CLR = "BFBFBF"
 
 
@@ -51,14 +54,18 @@ def _auto_width(ws, min_w=10, max_w=52):
 def load_data():
     cr_df = pd.read_excel(INPUT_CR, sheet_name="Sheet1")
     vc_df = pd.read_excel(INPUT_VC, sheet_name="Sheet1")
-    return cr_df, vc_df
+    rp_df = pd.read_excel(INPUT_RP, sheet_name="Sheet1")
+    return cr_df, vc_df, rp_df
 
 
 def find_cr_increases(cr_df):
     records = []
+    available = set(cr_df.columns)
     for _, row in cr_df.iterrows():
         for i in range(1, len(MONTHS)):
             prev_m, curr_m = MONTHS[i - 1], MONTHS[i]
+            if prev_m not in available or curr_m not in available:
+                continue  # month not yet added to the input file
             pv, cv = row[prev_m], row[curr_m]
             if pd.notna(pv) and pd.notna(cv) and cv > pv:
                 records.append({
@@ -123,6 +130,48 @@ def build_brand_summary(no_rebate):
         .reset_index()
         .sort_values("CR_Increase_Instances", ascending=False)
     )
+
+
+def classify_by_price(no_rebate, rp_df):
+    """Split no-rebate CR increases by whether retail price fell in the same month."""
+    rp = rp_df.copy()
+    rp["Item"] = rp["Item"].astype(float)
+    month_cols = [c for c in rp.columns if c not in
+                  ["Brand", "Program-Category", "Description | Color | Size", "ASIN", "Item"]]
+    rp_lookup = rp.drop_duplicates("Item").set_index("Item")[month_cols]
+
+    price_down, price_stable = [], []
+
+    for _, row in no_rebate.iterrows():
+        item   = row["Item"]
+        curr_m = row["Month"]
+        prev_m = row["Prev Month"]
+        rec    = row.to_dict()
+
+        cp = pp = None
+        if item in rp_lookup.index:
+            if curr_m in rp_lookup.columns:
+                v = rp_lookup.at[item, curr_m]
+                cp = float(v) if pd.notna(v) else None
+            if prev_m in rp_lookup.columns:
+                v = rp_lookup.at[item, prev_m]
+                pp = float(v) if pd.notna(v) else None
+
+        rec["Prev Price"] = round(pp, 2) if pp is not None else None
+        rec["Curr Price"] = round(cp, 2) if cp is not None else None
+        rec["Price Change"] = round(cp - pp, 2) if (cp is not None and pp is not None) else None
+
+        if cp is not None and pp is not None and cp < pp:
+            rec["Price Direction"] = "Down"
+            price_down.append(rec)
+        elif cp is not None and pp is not None and cp > pp:
+            rec["Price Direction"] = "Up"
+            price_stable.append(rec)
+        else:
+            rec["Price Direction"] = "Flat / No Data"
+            price_stable.append(rec)
+
+    return pd.DataFrame(price_down), pd.DataFrame(price_stable)
 
 
 # ── Sheet builders ────────────────────────────────────────────────────────────
@@ -191,14 +240,15 @@ def write_data_sheet(wb, df, sheet_name, title, subtitle, tab_color,
     _auto_width(ws)
 
 
-def write_executive_summary(wb, cr_increases, no_rebate, with_rebate, brand_summary):
+def write_executive_summary(wb, cr_increases, no_rebate, with_rebate, brand_summary,
+                            price_down, price_stable, active_months=None):
     ws = wb.create_sheet("Executive Summary", 0)
     ws.sheet_properties.tabColor = NAVY
 
     today = date.today().strftime("%B %d, %Y")
 
     # ── Title ─────────────────────────────────────────────────────────────────
-    ws.merge_cells("A1:F1")
+    ws.merge_cells("A1:H1")
     c = ws["A1"]
     c.value     = "Conversion Rate Organic Growth Analysis"
     c.fill      = _fill(NAVY)
@@ -206,7 +256,7 @@ def write_executive_summary(wb, cr_increases, no_rebate, with_rebate, brand_summ
     c.alignment = _align("center")
     ws.row_dimensions[1].height = 38
 
-    ws.merge_cells("A2:F2")
+    ws.merge_cells("A2:H2")
     c = ws["A2"]
     c.value     = f"Items with CR Increase and No Deal or Coupon Rebate  |  Run Date: {today}"
     c.fill      = _fill(BLUE)
@@ -218,10 +268,12 @@ def write_executive_summary(wb, cr_increases, no_rebate, with_rebate, brand_summ
 
     # ── Key metric boxes ──────────────────────────────────────────────────────
     metrics = [
-        ("Total CR\nIncrease\nInstances", len(cr_increases),          BLUE,      WHITE),
-        ("CR Increased\nWith Rebate",     len(with_rebate),            ORANGE_BG, ORANGE_FG),
-        ("CR Increased\nNo Rebate",       len(no_rebate),              GREEN_BG,  GREEN_FG),
-        ("Unique Items\n(No Rebate)",     no_rebate["Item"].nunique(), GREEN_BG,  GREEN_FG),
+        ("Total CR\nIncrease\nInstances",             len(cr_increases),              BLUE,       WHITE),
+        ("CR Increased\nWith Rebate",                 len(with_rebate),               ORANGE_TAB, WHITE),
+        ("CR Increased\nNo Rebate",                   len(no_rebate),                 GREEN_TAB,  WHITE),
+        ("Unique Items\n(No Rebate,\nNo Price Decrease)", price_stable["Item"].nunique(), LIME_TAB, WHITE),
+        ("No Rebate\nPrice Decreased",                len(price_down),                RED_TAB,    WHITE),
+        ("No Rebate\nPrice Stable / Up",              len(price_stable),              LIME_TAB,   WHITE),
     ]
     for i, (label, val, bg, fg) in enumerate(metrics):
         col = i + 1
@@ -244,8 +296,8 @@ def write_executive_summary(wb, cr_increases, no_rebate, with_rebate, brand_summ
     # ── Brand summary table ───────────────────────────────────────────────────
     ws.merge_cells("A7:D7")
     c = ws["A7"]
-    c.value     = "Organic CR Growth by Brand  (No Rebate Active)"
-    c.fill      = _fill(NAVY)
+    c.value     = "Organic CR Growth by Brand  (No Rebate  |  No Retail Price Decrease)"
+    c.fill      = _fill(GREEN_TAB)
     c.font      = _font(bold=True, color=WHITE, size=12)
     c.alignment = _align("center")
     ws.row_dimensions[7].height = 24
@@ -288,25 +340,36 @@ def write_executive_summary(wb, cr_increases, no_rebate, with_rebate, brand_summ
     ws.row_dimensions[tot_row].height = 18
 
     # ── Methodology note ──────────────────────────────────────────────────────
+    if active_months and len(active_months) >= 2:
+        month_range = f"{active_months[0]} through {active_months[-1]}"
+    elif active_months:
+        month_range = active_months[0]
+    else:
+        month_range = "months in data"
+
     note_row = tot_row + 2
-    ws.merge_cells(f"A{note_row}:F{note_row}")
+    ws.merge_cells(f"A{note_row}:H{note_row}")
     c = ws.cell(row=note_row, column=1,
-                value=("Methodology: CR increase = current month conversion rate strictly greater "
-                       "than prior month (Jan→Feb, Feb→Mar, Mar→Apr, Apr→May 2026). "
+                value=(f"Methodology: CR increase = current month conversion rate strictly greater "
+                       f"than prior month ({month_range}, consecutive pairs only). "
                        "Rebate check: Deals Rebate or Coupons Rebate > 0 in VC Master Data "
-                       "for the same item and month."))
+                       "for the same item and month. "
+                       "Price classification: retail price for the CR-increase month vs. prior month "
+                       "from Retail Prices file; rows with no price data for either month are included "
+                       "in 'Price Stable / Up'."))
     c.fill      = _fill(LT_BLUE)
     c.font      = _font(italic=True, size=9, color="404040")
     c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    ws.row_dimensions[note_row].height = 32
+    ws.row_dimensions[note_row].height = 40
 
     # Column widths
-    for col, w in zip("ABCDEF", [24, 14, 24, 14, 14, 14]):
+    for col, w in zip("ABCDEFGH", [24, 14, 24, 14, 14, 14, 14, 14]):
         ws.column_dimensions[col].width = w
 
 
 # ── Main output writer ────────────────────────────────────────────────────────
-def save_output(no_rebate, with_rebate, rebate_detail, brand_summary, cr_increases):
+def save_output(no_rebate, with_rebate, rebate_detail, brand_summary, cr_increases,
+                price_down, price_stable, active_months=None):
     TEXT_COLS = ["Item", "ASIN", "Brand", "Program-Category",
                  "Description | Color | Size", "Month", "Prev Month"]
     try:
@@ -315,7 +378,8 @@ def save_output(no_rebate, with_rebate, rebate_detail, brand_summary, cr_increas
     except Exception:
         wb = Workbook()
 
-    write_executive_summary(wb, cr_increases, no_rebate, with_rebate, brand_summary)
+    write_executive_summary(wb, cr_increases, no_rebate, with_rebate, brand_summary,
+                            price_down, price_stable, active_months)
 
     write_data_sheet(
         wb,
@@ -325,6 +389,30 @@ def save_output(no_rebate, with_rebate, rebate_detail, brand_summary, cr_increas
         subtitle="Items where conversion rate improved month-over-month with no active rebate",
         tab_color=GREEN_TAB,
         pct_col_names=["Prev CR", "Curr CR", "CR Change"],
+        text_col_names=TEXT_COLS,
+    )
+
+    write_data_sheet(
+        wb,
+        price_down.sort_values(["Brand", "Item", "Month"]) if not price_down.empty else price_down,
+        sheet_name="No Rebate - Price Down",
+        title="CR Increase — No Rebate & Retail Price Decreased",
+        subtitle="Organic CR increase where retail price also fell that month (price-sensitive lift)",
+        tab_color=RED_TAB,
+        pct_col_names=["Prev CR", "Curr CR", "CR Change"],
+        cur_col_names=["Prev Price", "Curr Price", "Price Change"],
+        text_col_names=TEXT_COLS,
+    )
+
+    write_data_sheet(
+        wb,
+        price_stable.sort_values(["Brand", "Item", "Month"]) if not price_stable.empty else price_stable,
+        sheet_name="No Rebate - Price Stable",
+        title="CR Increase — No Rebate & Price Held or Rose",
+        subtitle="Truly organic CR increase: no rebate active and retail price did not decrease",
+        tab_color=LIME_TAB,
+        pct_col_names=["Prev CR", "Curr CR", "CR Change"],
+        cur_col_names=["Prev Price", "Curr Price", "Price Change"],
         text_col_names=TEXT_COLS,
     )
 
@@ -359,14 +447,18 @@ def save_output(no_rebate, with_rebate, rebate_detail, brand_summary, cr_increas
 
 
 # ── Console summary ───────────────────────────────────────────────────────────
-def print_summary(cr_increases, no_rebate, with_rebate, brand_summary):
+def print_summary(cr_increases, no_rebate, with_rebate, brand_summary, price_down, price_stable):
     print(f"\n{'='*55}")
     print("  Conversion Rate Increase + Rebate Analysis")
     print(f"{'='*55}")
     print(f"  Total CR increase instances (all):   {len(cr_increases):>5}")
     print(f"  CR increased WITH rebate:            {len(with_rebate):>5}")
     print(f"  CR increased WITHOUT rebate:         {len(no_rebate):>5}")
-    print(f"  Unique items (no rebate):            {no_rebate['Item'].nunique():>5}")
+    print(f"  Unique items (no rebate, no price drop): {price_stable['Item'].nunique():>5}")
+    print(f"\n  Price classification (no-rebate items):")
+    print(f"  {'-'*45}")
+    print(f"  Price decreased that month:          {len(price_down):>5}")
+    print(f"  Price stable or rose:                {len(price_stable):>5}")
     print(f"\n  Summary by Brand (no rebate):")
     print(f"  {'-'*45}")
     for _, r in brand_summary.iterrows():
@@ -377,7 +469,10 @@ def print_summary(cr_increases, no_rebate, with_rebate, brand_summary):
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     print("Loading data...")
-    cr_df, vc_df = load_data()
+    cr_df, vc_df, rp_df = load_data()
+
+    active_months = [m for m in MONTHS if m in cr_df.columns]
+    print(f"Months found in CR file: {', '.join(active_months)}")
 
     print("Finding conversion rate increases...")
     cr_increases = find_cr_increases(cr_df)
@@ -388,13 +483,19 @@ def main():
     print("Splitting results by rebate presence...")
     no_rebate, with_rebate = split_by_rebate(cr_increases, rebate_months)
 
+    print("Classifying no-rebate items by retail price change...")
+    price_down, price_stable = classify_by_price(no_rebate, rp_df)
+
     rebate_detail = build_rebate_detail(vc_df)
-    brand_summary = build_brand_summary(no_rebate)
+
+    # Brand summary: CR up + no rebate + price did NOT decrease
+    brand_summary = build_brand_summary(price_stable)
 
     print("Saving formatted output file...")
-    save_output(no_rebate, with_rebate, rebate_detail, brand_summary, cr_increases)
+    save_output(no_rebate, with_rebate, rebate_detail, brand_summary, cr_increases,
+                price_down, price_stable, active_months)
 
-    print_summary(cr_increases, no_rebate, with_rebate, brand_summary)
+    print_summary(cr_increases, no_rebate, with_rebate, brand_summary, price_down, price_stable)
 
 
 if __name__ == "__main__":
